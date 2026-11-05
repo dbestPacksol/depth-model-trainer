@@ -205,7 +205,7 @@ class SnapshotImportTests(unittest.TestCase):
     def test_default_depth_scale_uses_orbbec_millimeters(self):
         from download_snapshots import parse_arguments
 
-        with patch("sys.argv", ["download_snapshots.py", "--list-only"]):
+        with patch("sys.argv", ["download_snapshots.py", "--list-only", "--access_key", "testing", "--secret_key", "testing"]):
             self.assertEqual(parse_arguments().depth_scale, 1000)
 
 

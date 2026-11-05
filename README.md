@@ -1,6 +1,7 @@
 # depth-model-trainer
 
-Train or fine-tune an Ultralytics YOLO26 depth estimator with a local dataset.
+Train or fine-tune an Ultralytics YOLO26 depth estimator with a reviewed dataset
+shared through this repository's dedicated S3 bucket and cached locally.
 The model learns to predict depth from **RGB alone**; depth PNGs are the target
 values used during training and validation.
 
@@ -16,114 +17,159 @@ For NVIDIA GPU training, install a CUDA-enabled PyTorch build appropriate for
 your system using the [PyTorch installer](https://pytorch.org/get-started/locally/).
 CPU training is also available with `--device cpu`.
 
-## Import camera snapshots from S3
+## Configure the repository S3 bucket
 
-`download_snapshots.py` downloads the camera server's snapshots and builds the
-directory pattern used by `train_model.py`.
+The repo's **fresh, dedicated bucket** is the shared cloud source for reviewed
+training pairs and archived training results. Set these values in the local
+`.env` (see `.env.example`):
 
-The inspected Vision-Test pipeline is:
+```dotenv
+ACCESS_KEY=your-access-key
+SECRET_KEY=your-secret-key
+BUCKET_NAME=your-repository-bucket
+```
 
-1. `POST /snapshot` in `vision-camera-server` writes one pair per physical camera
-   under `data/snapshots/snapshot_<Unix timestamp>/<camera name or ID>/`:
-   `rgb.png`, lossless 16-bit `depth.png`, and `frame.json`. The capture directory
-   also contains `snapshot.json`.
-2. Vision-Test's `docker-compose.yml` mounts the same `vision-camera-data` volume
-   at `/app/vision-camera-server/data` in the camera server and `/data` in
-   `aws_uploader`. The uploader watches `/data` and targets
-   **`computer-vision-sessions`**.
-3. `aws_directory_uploader` waits for each file to be unchanged across two scans
-   and idle for more than 20 seconds, uploads it, then removes the local file.
-   Its S3 key is `<storage prefix>/<path relative to /data>`. The prefix is
-   `STORAGE_DIRECTORY` when set, otherwise `BALENA_DEVICE_NAME_AT_INIT`, otherwise
-   `Test`. The inspected Compose file does not explicitly set the prefix.
+Commands load `.env` from the repository root, even when invoked from another
+working directory. Existing environment variables take precedence. Credentials
+are never stored in manifests. `.env` is ignored by Git. Configure the bucket's
+region through `AWS_DEFAULT_REGION` if needed. The bucket must already exist;
+the scripts do not create buckets or alter bucket policies.
 
-For example, an uploaded image can be:
+The credentials need `s3:ListBucket` on the bucket and `s3:GetObject`,
+`s3:PutObject`, and `s3:AbortMultipartUpload` on `datasets/*` and `runs/*`.
+Delete permissions are not required. Keep the bucket private.
 
 ```text
-s3://computer-vision-sessions/<device>/snapshots/snapshot_1792780000/front/rgb.png
-s3://computer-vision-sessions/<device>/snapshots/snapshot_1792780000/front/depth.png
+s3://BUCKET_NAME/
+  datasets/
+    curated/                       # Change with --dataset <name>
+      manifest.json                # Reviewed paths, depth settings, SHA-256 and sizes
+      objects/<sha256>              # Exact RGB JPG/depth PNG bytes, deduplicated by hash
+  runs/
+    <unique-run-id>/
+      manifest.json                # Original output paths, hashes, training provenance
+      objects/<sha256>              # Weights, metrics, plots, settings and other outputs
 ```
 
-The Orbbec cameras report depth in millimeters, so `--depth-scale` defaults to
-`1000`: a PNG value of `1500` represents `1.5` meters. The camera code copies raw
-SDK uint16 values into the PNG without recording a scale in `frame.json`.
-Override `--depth-scale` when importing data with another encoding.
-The importer preserves the depth PNG bytes exactly
-and records the chosen scale in the generated dataset YAML. Training reuses this
-saved scale and depth limit unless you explicitly override them.
+Manifests map each original relative path to its object hash. Dataset paths use
+`images/{train,val}/...jpg` and `depth/{train,val}/...png`; run paths include
+`weights/best.pt`, `weights/last.pt`, `results.csv`, plots and settings when
+present. Download commands reconstruct those directories. Generated dataset YAML
+uses machine-specific absolute paths and is rebuilt locally rather than uploaded.
+Raw snapshots, review reports, caches, and files outside the paired data folders
+are excluded from dataset uploads. Run archives exclude hidden files/directories.
 
-Supply the access key and secret key on the command line. The default bucket is
-`computer-vision-sessions`. The script does not read Compose files or contain
-default credentials.
+## Review frames, then upload selected pairs
+
+`download_snapshots.py` is an **optional acquisition helper**. It reads snapshots
+from the camera pipeline's source bucket (`computer-vision-sessions` by default),
+converts RGB PNGs to quality-95 JPGs, preserves depth PNG bytes, and creates a
+local candidate dataset. This source bucket is separate from `BUCKET_NAME`.
+Downloading snapshots does **not** approve them or publish them to the repo bucket.
 
 ```powershell
-python download_snapshots.py --access_key "your-access-key" --secret_key "your-secret-key"
+python download_snapshots.py --bucket_name computer-vision-sessions --prefix "device-name/" --output datasets/snapshot-review
 ```
 
-Override the bucket when needed:
+The helper uses `ACCESS_KEY` and `SECRET_KEY` from `.env` by default. If source
+credentials differ, supply `--access_key` and `--secret_key` for this helper only.
+Source credentials need ListBucket and GetObject. It scans every listing page
+under the prefix; without `--prefix` it scans the entire source bucket.
+`--list-only` shows counts without downloading. It recognizes
+`<device>/snapshots/snapshot_<Unix timestamp>/<camera>/rgb.png`, `depth.png`, and
+optional `frame.json`, ignoring session/event videos. Camera depth defaults to
+millimeters (`--depth-scale 1000`); override for other encodings.
+
+The staging directory contains `raw/`, `images/{train,val}/`,
+`depth/{train,val}/`, `import_report.jsonl`, `import_settings.json`, and a generated
+dataset YAML. Incomplete pairs and failures are reported. Rerunning resumes raw
+downloads and regenerates candidate images, preserving capture split assignments.
+All cameras from a capture stay together; use `--split-by day` to group by device
+and UTC day. At least two complete groups are required. Use `--val-fraction` and
+`--seed` to configure the initial split.
+
+**Review the candidates**, then copy only selected matching RGB/depth files into
+`datasets/curated/images/{train,val}/` and `datasets/curated/depth/{train,val}/`,
+keeping the same relative names and capture/session split boundaries. Do not sync
+the staging directory unless you intend to approve every valid pair in it.
+For non-default depth encoding, validate the curated directory with
+`--depth-scale` and `--max-depth` before its first upload; those settings are then
+shared in the cloud manifest.
 
 ```powershell
-python download_snapshots.py --access_key "your-access-key" --secret_key "your-secret-key" --bucket_name "your-bucket"
+python train_model.py --data datasets/curated --check-data
+python sync_s3.py dataset push --data datasets/curated
 ```
 
-The credentials need `s3:ListBucket` and `s3:GetObject`; uploader write permissions
-alone may not include those. Credentials are not written into the dataset or
-printed by the script. S3 access uses the SDK's default region handling.
+`push` uploads the validated local train/validation pairs into the named cloud
+dataset. Both splits must contain usable pairs. Use unique sample names across
+captures/devices; split and relative name identify each pair. Additional reviewed
+pairs can be added locally and uploaded with the same command.
 
-By default, the importer scans **the entire bucket**, across all device prefixes,
-using every listing page. Only the snapshot layout is imported; event/session
-videos are ignored. Use `--prefix "device-name/"` to select one device, or add
-`--list-only` to inspect sample counts without downloading or creating local files.
-
-The output looks like:
-
-```text
-datasets/snapshots/
-├── raw/<snapshot timestamp + source hash>/
-│   ├── rgb.png                     # Original downloaded PNG
-│   ├── depth.png                   # Original downloaded PNG
-│   ├── frame.json                  # Downloaded when present in the listing
-│   └── *.s3.json                   # Source fingerprints and local SHA-256 hashes
-├── images/{train,val}/<sample ID>.jpg
-├── depth/{train,val}/<sample ID>.png
-├── depth_dataset.generated.yaml
-├── import_settings.json            # Saved settings and fixed group assignments
-└── import_report.jsonl             # Results and source keys from the latest scan
-```
-
-RGB PNGs become quality-95 JPGs without changing their orientation or dimensions.
-Depth is copied unchanged. Source hashes prevent filename collisions between
-devices and cameras, and remote names are not used as local paths.
-
-The default validation fraction is 20%. All cameras from a single capture stay
-in the same split. Use `--split-by day` to keep each device's entire UTC day
-together, which is a stronger boundary for nearby, similar captures. At least
-two complete groups are needed to produce both splits. The initial split reserves
-at least one group for each split; group counts, rather than exact image counts,
-determine the fraction. Set `--val-fraction` and `--seed` to adjust it.
-
-Rerun the **same command** to resume. Verified local raw files are reused, newly
-arrived files are downloaded, and existing groups keep their split assignments.
-Images are regenerated from the raw copies. Incomplete S3 pairs are downloaded
-to `raw/`, reported, and excluded from training until their missing partner arrives.
-Files upload independently, so an incomplete pair can simply mean an upload is
-still in progress. Invalid images and download failures are reported, other
-samples continue, and the command exits with an error so failures are visible.
-Conditional downloads reject objects that changed since listing; rerunning scans
-their new versions. New dataset YAML is written only after all complete samples
-pass and both splits contain usable images.
-
-Use a new output directory to change import settings. Local files from earlier
-imports are retained even if their source objects later disappear from S3.
-The script reads S3 and does not change remote objects or the producer/uploader.
-`snapshot.json` is not required or downloaded; pairing uses the actual listed image
-keys because individual files can arrive out of order.
-
-Then train directly:
+## Sync the local training dataset
 
 ```powershell
-python train_model.py --data datasets/snapshots --device 0
+# Restore the shared dataset on another machine (or download new cloud pairs).
+python sync_s3.py dataset pull --data datasets/curated
+
+# Download cloud additions, then upload local additions.
+python sync_s3.py dataset sync --data datasets/curated
+
+# Keep independent dataset versions or depth conventions in separate namespaces.
+python sync_s3.py dataset sync --data datasets/experiment --dataset experiment
 ```
+
+Sync is additive: missing files are transferred, matching files are reused,
+and neither local nor remote files are deleted. Different content at the same
+relative path, or incompatible depth settings, causes an error. Move a conflicting
+local copy aside to accept the cloud copy; use a new sample name or a new dataset
+name for intentionally revised data. A pull retains additional local pairs.
+Removing a local file does not remove its cloud counterpart; a later pull restores
+it. For a revised selection that excludes published pairs, create a new dataset.
+An empty bucket can be initialized with `push` or `sync` from a valid local dataset;
+`pull` reports that no dataset exists yet.
+
+Transfers verify SHA-256 and sizes. Downloads stage and validate the complete cloud
+dataset before installing new pairs. Uploads publish `manifest.json` only after
+all files finish, so interrupted uploads cannot expose half a pair. Conditional
+manifest writes detect concurrent updates; rerun after that error. Interrupted
+uploads may leave unreferenced objects, which are harmless and are not synced.
+The commands do not remove historical or unreferenced objects automatically.
+
+Train with automatic dataset sync and result archiving:
+
+```powershell
+python train_model.py --data datasets/curated --sync-s3 --upload-results --device 0
+```
+
+`--sync-s3` uses the same additive review policy: every valid local pair in `--data`
+is considered selected for sharing. Omit the cloud flags for entirely local
+training. `--check-data` never starts training or uploads results, but an explicit
+`--sync-s3` still transfers the dataset. `--dataset` chooses the shared dataset.
+On the initial upload, training's `--depth-scale` and `--max-depth` set the shared
+depth convention; later invocations cannot override it with a different value.
+
+## Archive and restore trained results
+
+Each archive has a unique run ID and preserves the whole output directory,
+including checkpoints, metrics, plots, and run settings. Existing run IDs cannot
+be overwritten; an updated run must receive a new ID. With both training cloud
+flags enabled, the archive also records the dataset manifest and its fingerprint
+so the exact cloud training inputs are traceable. Without `--sync-s3`, dataset
+provenance is not inferred. An upload failure leaves local results intact; retry
+using the standalone archive command:
+
+```powershell
+python sync_s3.py runs push --path runs/depth/train --run-id experiment-001
+python sync_s3.py runs list
+python sync_s3.py runs pull --run-id experiment-001 --path runs/restored/experiment-001
+python train_model.py --data datasets/curated --model runs/restored/experiment-001/weights/best.pt --device 0
+```
+
+Omit `--run-id` on push to generate an ID from the directory name, UTC time, and
+random suffix. Only completed run manifests appear in `runs list`. Restores verify
+checksums and refuse to overwrite different local files. These are explicit
+archives after successful training; they do not stream checkpoints during a run.
 
 ## Dataset directory pattern
 
@@ -166,8 +212,8 @@ my_dataset/
   `depth_in_meters = png_value / depth_scale`.
 - Split data into training and held-out validation sets yourself. Keep related
   recording sessions together so nearly identical frames do not leak between
-  splits. `train_model.py` does not split or move files; the S3 importer creates
-  the splits described above.
+  splits. `train_model.py` does not split or move files; the snapshot helper creates
+  candidate splits that you review before syncing.
 - No bounding-box labels or `labels/` folder are needed.
 
 ## Validate the data
@@ -233,7 +279,11 @@ contains the dataset checks and YAML generation. Run `python train_model.py --he
 to see every setting. The data layout follows the
 [Ultralytics depth dataset format](https://docs.ultralytics.com/datasets/depth/).
 
-`download_snapshots.py` coordinates the S3 import. Its helpers are
+`sync_s3.py` manages reviewed cloud data and run archives through
+`helper/cloud_storage.py`; `helper/cloud_config.py` loads repository credentials.
+Run `python sync_s3.py --help` for cloud commands.
+
+`download_snapshots.py` coordinates the optional snapshot staging import. Its helpers are
 `helper/snapshot_s3.py` for listing, credentials, and downloads, and
 `helper/snapshot_dataset.py` for splitting, conversion, and the import report.
 Run `python download_snapshots.py --help` for importer settings. To run the tests:

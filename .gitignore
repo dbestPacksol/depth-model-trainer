@@ -150,7 +150,7 @@ activemq-data/
 *.sage.py
 
 # Environments
-.env
+# .env
 .envrc
 .venv
 env/
@@ -224,3 +224,4 @@ __marimo__/
 /datasets/
 *.pt
 depth_dataset.generated.yaml
+/.env

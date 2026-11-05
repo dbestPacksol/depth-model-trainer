@@ -2,7 +2,10 @@
 
 import argparse
 import math
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 from helper.snapshot_dataset import build_dataset
 from helper.snapshot_s3 import create_s3_client, find_snapshots
@@ -15,10 +18,11 @@ DEFAULT_BUCKET_NAME = "computer-vision-sessions"
 
 
 def parse_arguments() -> argparse.Namespace:
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("datasets/snapshots"), help="Local dataset directory.")
-    parser.add_argument("--access_key", default=DEFAULT_ACCESS_KEY, help="AWS access key ID.")
-    parser.add_argument("--secret_key", default=DEFAULT_SECRET_KEY, help="AWS secret access key.")
+    parser.add_argument("--access_key", default=os.environ.get("ACCESS_KEY", DEFAULT_ACCESS_KEY), help="Source AWS access key ID; default: ACCESS_KEY from .env.")
+    parser.add_argument("--secret_key", default=os.environ.get("SECRET_KEY", DEFAULT_SECRET_KEY), help="Source AWS secret key; default: SECRET_KEY from .env.")
     parser.add_argument("--bucket_name", default=DEFAULT_BUCKET_NAME, help="S3 bucket; default: computer-vision-sessions.")
     parser.add_argument("--prefix", default="", help="Optional device/S3 folder prefix. Default: scan the entire bucket.")
     parser.add_argument("--val-fraction", type=float, default=0.2, help="Fraction of capture groups held out for validation.")

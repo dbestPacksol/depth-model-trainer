@@ -21,6 +21,9 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--project", type=Path, default=Path("runs/depth"), help="Training output directory.")
     parser.add_argument("--name", default="train", help="Run name; existing runs get a new numbered directory.")
     parser.add_argument("--check-data", action="store_true", help="Validate the dataset and write YAML without training.")
+    parser.add_argument("--sync-s3", action="store_true", help="Sync reviewed pairs with S3 before training.")
+    parser.add_argument("--upload-results", action="store_true", help="Archive the completed training run to S3.")
+    parser.add_argument("--dataset", default="curated", help="Cloud dataset name for --sync-s3.")
     args = parser.parse_args()
 
     for setting in ("epochs", "imgsz", "batch", "lr0", "depth_scale", "max_depth"):
@@ -36,6 +39,22 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_arguments()
+
+    cloud = None
+    provenance = {}
+    if args.sync_s3 or (args.upload_results and not args.check_data):
+        from helper.cloud_config import cloud_settings
+
+        cloud = cloud_settings()
+    if args.sync_s3:
+        import hashlib
+        import json
+        from helper.cloud_storage import sync_dataset
+
+        manifest = sync_dataset(*cloud, args.data, args.dataset,
+                                depth_scale=args.depth_scale, max_depth=args.max_depth)
+        provenance = {"dataset": args.dataset, "manifest_sha256": hashlib.sha256(
+            json.dumps(manifest, sort_keys=True).encode()).hexdigest(), "manifest": manifest}
 
     # Check every pair before downloading weights or starting a training run.
     from helper.dataset import prepare_dataset
@@ -74,6 +93,11 @@ def main() -> None:
     run_directory = Path(model.trainer.save_dir)
     print(f"Best model: {run_directory / 'weights' / 'best.pt'}")
     print(f"Last model: {run_directory / 'weights' / 'last.pt'}")
+    if args.upload_results:
+        from helper.cloud_storage import upload_run
+
+        run_id = upload_run(*cloud, run_directory, provenance=provenance)
+        print(f"Archived run: s3://{cloud[1]}/runs/{run_id}/")
 
 
 if __name__ == "__main__":
