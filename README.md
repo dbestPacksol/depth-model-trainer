@@ -17,6 +17,41 @@ For NVIDIA GPU training, install a CUDA-enabled PyTorch build appropriate for
 your system using the [PyTorch installer](https://pytorch.org/get-started/locally/).
 CPU training is also available with `--device cpu`.
 
+## Prepared collector dataset
+
+The dataset imported on 2026-11-09 from
+`/home/dale/Documents/Repos/Packsol/depth-frame-collector/dataset` is cached at
+`datasets/curated` and published as the S3 dataset `curated`. It now contains 5,000
+original RGB/depth pairs: 4,394 training and 606 validation, at 1280 × 720.
+The expansion added 2,000 pairs and preserved all 3,000 original pairs and splits.
+Depth is uint16 millimeters (`depth_scale: 1000`); zero pixels remain invalid.
+Validation holds out Alina, Park 12 The Collection, Valdok, and Evoq East Cobb
+entirely. Preserve these splits when adding data.
+
+The local copy retains the collector's selection manifest, capture metadata,
+summaries, and review sheets. S3 dataset sync publishes only the image/depth pairs
+and their checksums/settings; it does not back up those supporting records.
+Source checksums were checked for all 10,000 RGB/depth files during import.
+All unique S3 objects were read back and SHA-256 verified after publication.
+Local evidence is saved in
+`datasets/curated/s3_verification.json` and `datasets/curated/verification.json`.
+The installed Ultralytics 8.4.208 depth loader verified both splits and loaded
+sample batches with the expected depth conversion.
+The collector's copied `data.yaml` is regenerated with this checkout's path;
+`train_model.py` uses `depth_dataset.generated.yaml`.
+
+```bash
+# On another machine, restore the same training inputs first.
+python sync_s3.py dataset pull --data datasets/curated
+python train_model.py --data datasets/curated --check-data
+
+# Start fine-tuning on a machine with a working CUDA installation.
+python train_model.py --data datasets/curated --model yolo26s-depth.pt --sync-s3 --upload-results --device 0
+```
+
+Dataset preparation does not start training. Pretrained weights download on the
+first training invocation if absent locally.
+
 ## Configure the repository S3 bucket
 
 The repo's **fresh, dedicated bucket** is the shared cloud source for reviewed
@@ -135,6 +170,10 @@ all files finish, so interrupted uploads cannot expose half a pair. Conditional
 manifest writes detect concurrent updates; rerun after that error. Interrupted
 uploads may leave unreferenced objects, which are harmless and are not synced.
 The commands do not remove historical or unreferenced objects automatically.
+Uploads use up to eight concurrent transfers, deduplicate identical pending
+content, and print object counts as they complete. The manifest is published only
+after all transfers succeed. Retrying an interrupted initial push may re-upload
+unreferenced objects from that attempt.
 
 Train with automatic dataset sync and result archiving:
 
@@ -238,8 +277,8 @@ python train_model.py --data "C:/datasets/my_dataset" --device 0
 ```
 
 Defaults: `yolo26s-depth.pt`, 20 epochs, image size 640, batch size 8,
-AdamW with an initial learning rate of `0.0001` and gentle warmup, and zero data
-loader workers. These learning-rate settings follow the
+AdamW with an initial learning rate of `0.0001` and gentle warmup, and four data
+loader workers per GPU on Linux (zero on Windows). These learning-rate settings follow the
 [Ultralytics fine-tuning guidance](https://docs.ultralytics.com/tasks/depth/#fine-tuning-on-your-own-data).
 The pretrained model downloads on first use if it is not already available.
 
@@ -254,6 +293,55 @@ memory is insufficient. Omit `--device` to let Ultralytics select a device.
 For depth PNGs using a different scale, add e.g. `--depth-scale 256`.
 Use `--max-depth 10` to set the upper validation depth limit to 10 meters;
 this does not cap the model's predictions.
+
+### Performance on the dual RTX 3090 workstation
+
+Use explicit GPU selection and enough loading workers to keep the GPUs supplied:
+
+```bash
+python train_model.py --data datasets/curated --device 0,1 --batch 32 --workers 4 --cache ram --upload-results
+```
+
+`--batch` is the total across GPUs: 32 supplies 16 samples to each GPU. The batch
+must be divisible by the GPU count. Automatic device selection does not request
+both GPUs. The 128-training/32-validation-pair smoke test completed on both 3090s
+with these batch/worker/cache settings, using approximately 4.8 GB per GPU.
+Increase the batch in steps after checking throughput and memory use; a larger
+batch alone does not guarantee faster training.
+
+The original zero-worker setting decodes, augments, and assembles samples in the
+training process. On this Ryzen 9 5900X workstation, a warm data-only benchmark
+using the real depth dataset at 640 pixels and batch 8 supplied approximately
+80 images/sec with zero workers, 271 with four, and 449 with eight. These isolated
+loading rates are not full training rates. A separate single-3090 AMP
+forward/loss/backward benchmark achieved approximately 133 images/sec at batch 8,
+143 at batch 16, and 145 at batch 24. Each test used short warmed-up loops;
+optimizer updates, DDP communication, validation, and startup add overhead.
+A combined real-data forward/loss/backward test with deterministic operations
+enabled measured 47.5 images/sec with zero workers and 79.6 with four (about 1.67×).
+Eight workers measured 79.4 images/sec, so four was sufficient for that workload.
+This short single-GPU comparison excludes optimizer updates and is not a forecast
+of full two-GPU epoch time.
+
+`--cache ram` caches decoded RGB images; depth PNGs are still decoded per sample.
+It consumes host RAM separately from GPU memory. Disk image caching is not
+exposed because it writes `.npy` files into the RGB directories, which the
+reviewed-data validator currently rejects. Four workers per GPU means eight
+training workers across both cards; `--workers 8` uses sixteen. Ultralytics can
+also create additional validation workers.
+
+AMP is already enabled by Ultralytics. `--no-deterministic` permits
+nondeterministic kernels when reproducibility is less important; it is optional,
+and was also used for the smoke test. `--no-plots` skips diagnostic plots,
+including the startup depth-distribution plot, but keeps validation enabled.
+Neither option changes the fine-tuning learning rate.
+
+`--sync-s3` runs before training and includes hashing, staging, and full data
+validation. It can cause a long startup with idle GPUs, but does not run during
+each training batch. When the dataset is already current, omit it as above;
+`--upload-results` still archives the completed run. Preparation time and loader
+settings are printed separately. For archived dataset-manifest provenance,
+retain `--sync-s3` and accept its preparation cost.
 
 ## Train from scratch
 

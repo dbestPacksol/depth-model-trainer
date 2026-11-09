@@ -95,6 +95,15 @@ class CloudStorageTests(unittest.TestCase):
         sync_dataset(self.client, "bucket", self.root)
         self.assertIn("datasets/curated/manifest.json", self.client.objects)
 
+    def test_identical_content_is_uploaded_once_but_all_paths_are_published(self):
+        manifest = sync_dataset(self.client, "bucket", self.root, direction="push")
+        self.assertEqual(len(manifest["files"]), 4)
+        self.assertEqual(self.client.uploads, 2)  # Same RGB and depth in both splits.
+        destination = self.base / "deduplicated-restore"
+        sync_dataset(self.client, "bucket", destination, direction="pull")
+        for relative in manifest["files"]:
+            self.assertEqual((destination / relative).read_bytes(), (self.root / relative).read_bytes())
+
     def test_different_local_pair_is_never_overwritten(self):
         sync_dataset(self.client, "bucket", self.root)
         path = self.root / "images/train/session/frame.jpg"
@@ -192,9 +201,16 @@ class CloudStorageTests(unittest.TestCase):
         fake_ultralytics = types.SimpleNamespace(YOLO=Mock(return_value=model))
         with patch.dict("sys.modules", {"ultralytics": fake_ultralytics}), patch(
             "helper.cloud_config.cloud_settings", return_value=(self.client, "bucket")
-        ), patch("sys.argv", ["train_model.py", "--data", str(self.root), "--sync-s3", "--upload-results"]):
+        ), patch("sys.argv", ["train_model.py", "--data", str(self.root), "--sync-s3", "--upload-results",
+                             "--workers", "4", "--cache", "ram", "--no-deterministic", "--no-plots",
+                             "--device", "0,1", "--batch", "32"]):
             train_model.main()
         model.train.assert_called_once()
+        settings = model.train.call_args.kwargs
+        self.assertEqual((settings["device"], settings["batch"], settings["workers"]), ("0,1", 32, 4))
+        self.assertEqual(settings["cache"], "ram")
+        self.assertFalse(settings["deterministic"])
+        self.assertFalse(settings["plots"])
         key = next(k for k in self.client.objects if k.startswith("runs/") and k.endswith("manifest.json"))
         manifest = json.loads(self.client.objects[key])
         self.assertIn("weights/last.pt", manifest["files"])

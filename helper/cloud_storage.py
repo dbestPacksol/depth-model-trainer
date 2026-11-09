@@ -9,6 +9,7 @@ import math
 import re
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
@@ -82,13 +83,25 @@ def publish(client, bucket, prefix, root, paths, metadata, remote=None, etag=Non
     if manifest == remote:
         return manifest
     # Unique hashes cannot change objects used by a previously published manifest.
-    with tempfile.TemporaryDirectory() as temporary:
-        staged = Path(temporary) / "upload"
-        for path, entry in pending:
+    # Upload identical content only once, with bounded concurrency. Each worker
+    # owns its staging file so source changes cannot affect an in-flight upload.
+    objects = list({entry["sha256"]: (path, entry) for path, entry in pending}.values())
+
+    def upload(item):
+        path, entry = item
+        with tempfile.TemporaryDirectory() as temporary:
+            staged = Path(temporary) / "upload"
             shutil.copyfile(path, staged)
             if file_hash(staged) != entry["sha256"]:
                 raise ValueError(f"File changed during upload: {path}; stop writers and retry.")
             client.upload_file(str(staged), bucket, f"{prefix}/objects/{entry['sha256']}")
+
+    if objects:
+        print(f"Uploading {len(objects)} objects ({sum(e['size'] for _, e in objects):,} bytes)...", flush=True)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for completed, _ in enumerate(pool.map(upload, objects), 1):
+                if completed % 100 == 0 or completed == len(objects):
+                    print(f"Uploaded {completed}/{len(objects)} objects", flush=True)
     condition = {"IfMatch": etag} if etag else {"IfNoneMatch": "*"}
     try:
         client.put_object(Bucket=bucket, Key=f"{prefix}/manifest.json",
